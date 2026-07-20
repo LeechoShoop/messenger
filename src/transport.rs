@@ -37,6 +37,36 @@ where
     })
 }
 
+/// Unified outbound handler — mirror of `handle_inbound` for the dialing
+/// side of a connection.
+///
+/// Performs the mandatory Noise_XX handshake as the initiator with ML-DSA-87
+/// identity binding. Used when we open a connection to a peer discovered via
+/// LAN discovery (see discovery.rs) or a DHT bootstrap/lookup (see dht.rs),
+/// as opposed to `handle_inbound`, which runs on the accept side.
+pub async fn handle_outbound<S>(
+    stream: S,
+    is_wasm: bool,
+    noise_static: &[u8],
+    local_nr: &PrimusNR,
+    ml_dsa_sk: &[u8],
+) -> Result<PrimusTransportStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Mandatory Noise handshake occurs INSIDE the transport stream
+    let mut noise =
+        NoiseStream::handshake_initiator(stream, noise_static, local_nr, ml_dsa_sk).await?;
+
+    // Enable WASM padding if we are the browser/WASM side of this connection.
+    noise.is_wasm = is_wasm;
+
+    Ok(PrimusTransportStream {
+        noise,
+        is_leaf: is_wasm, // Leaf nodes (WASM/Light Clients) don't route traffic
+    })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod listeners {
     use super::*;

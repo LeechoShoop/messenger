@@ -50,7 +50,7 @@ use crate::peer::PrimusNR;
 
 use crate::dht::PrimusDHT;
 use crate::noise::BiStream;
-use crate::transport::{handle_inbound, listeners::WebTransportListener};
+use crate::transport::{handle_inbound, handle_outbound, listeners::WebTransportListener};
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 
@@ -328,6 +328,15 @@ pub struct PrimusNetworkServer<M, K> {
     local_nr: PrimusNR,
     noise_static: [u8; 32],
     ml_dsa_sk: Vec<u8>,
+    /// TLS SNI domain used both for our own self-signed cert and as the
+    /// `server_name` argument when dialing out via `endpoint.connect()`.
+    tls_domain: String,
+    /// External (NAT-mapped) address reported by `nat::NatService::open_world`,
+    /// if UPnP mapping has succeeded. Used by `connect_to_peer` for
+    /// self-connection avoidance — a peer discovered (e.g. via LAN beacon
+    /// relay or a DHT record populated before we knew our own external
+    /// address) may report back our own mapped address.
+    external_addr: Arc<Mutex<Option<SocketAddr>>>,
     /// Active session table: remote SocketAddr → PeerSession.
     /// DashMap gives lock-free concurrent reads across stream handlers.
     pub sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
@@ -405,10 +414,22 @@ where
             local_nr,
             noise_static,
             ml_dsa_sk,
+            tls_domain,
+            external_addr: Arc::new(Mutex::new(None)),
             sessions,
             frame_drops: Arc::new(AtomicU64::new(0)),
             relay,
         })
+    }
+
+    /// Record the external (NAT-mapped) address returned by
+    /// `nat::NatService::open_world`, for use in `connect_to_peer`'s
+    /// self-connection check. `open_world` only returns the external IP;
+    /// callers should pass `SocketAddr::new(external_ip, bound_port)` since
+    /// UPnP `add_port` maps the external port equal to the internal port
+    /// (see nat.rs).
+    pub async fn set_external_addr(&self, addr: SocketAddr) {
+        *self.external_addr.lock().await = Some(addr);
     }
 
     /// Start serving. Spawns two accept loops (QUIC + WebTransport) and
@@ -533,6 +554,135 @@ where
         // Park the calling task — both loops run on the Tokio runtime.
         futures::future::pending::<Result<()>>().await
     }
+
+    /// Dial out to `target_addr` over QUIC and establish a peer session.
+    ///
+    /// Used for connecting to peers discovered via LAN discovery
+    /// (discovery.rs's beacon listener) or a DHT bootstrap/lookup
+    /// (dht.rs / lib.rs's `find_node`), as opposed to `handle_native_connection`,
+    /// which handles the accept side of a connection.
+    ///
+    /// Self-connection avoidance compares `target_addr` (full IP + port) against
+    /// both our own bound QUIC endpoint address and, if known, our NAT-mapped
+    /// external address (see `set_external_addr`) — never by port alone, since
+    /// two distinct peers can share a port on different hosts.
+    ///
+    /// If we already hold a session for `target_addr`, this is a no-op that
+    /// returns `Ok(())` rather than opening a duplicate connection.
+    pub async fn connect_to_peer(&self, target_addr: SocketAddr) -> Result<()> {
+        let local_addr = self
+            .endpoint
+            .local_addr()
+            .context("QUIC: failed to read local endpoint address")?;
+        if target_addr == local_addr {
+            log::debug!(
+                "connect_to_peer: refusing to dial our own bound address {}",
+                target_addr
+            );
+            return Ok(());
+        }
+
+        if let Some(external_addr) = *self.external_addr.lock().await {
+            if target_addr == external_addr {
+                log::debug!(
+                    "connect_to_peer: refusing to dial our own external address {}",
+                    target_addr
+                );
+                return Ok(());
+            }
+        }
+
+        if self.sessions.contains_key(&target_addr) {
+            log::debug!(
+                "connect_to_peer: already have a session with {}, skipping",
+                target_addr
+            );
+            return Ok(());
+        }
+
+        log::info!("P2P: dialing peer at {}", target_addr);
+
+        let connecting = self
+            .endpoint
+            .connect(target_addr, &self.tls_domain)
+            .with_context(|| format!("QUIC: failed to start connection to {}", target_addr))?;
+        let connection = connecting
+            .await
+            .with_context(|| format!("QUIC: handshake failed connecting to {}", target_addr))?;
+
+        // The address we actually ended up connected to (should equal
+        // `target_addr` for QUIC, but re-derive it rather than assume, and
+        // re-check under it in case a concurrent dial/inbound connection
+        // from the same peer raced us here).
+        let remote_addr = connection.remote_address();
+        if self.sessions.contains_key(&remote_addr) {
+            log::debug!(
+                "connect_to_peer: session with {} appeared concurrently, dropping redundant connection",
+                remote_addr
+            );
+            connection.close(0u32.into(), b"duplicate session");
+            return Ok(());
+        }
+
+        // ── Mandatory Noise_XX handshake, initiator side, on a new bi-stream ───
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .with_context(|| format!("QUIC: failed to open handshake bi-stream to {}", target_addr))?;
+
+        let transport = handle_outbound(
+            BiStream {
+                reader: recv,
+                writer: send,
+            },
+            false, // native QUIC — no WASM padding
+            &self.noise_static,
+            &self.local_nr,
+            &self.ml_dsa_sk,
+        )
+            .await
+            .with_context(|| format!("Noise_XX handshake (outbound) failed with {}", target_addr))?;
+
+        let (_, noise_state) = transport.noise.into_parts();
+        let session = Arc::new(PeerSession::new(
+            PrimusConnection::Quic(connection.clone()),
+            noise_state,
+        ));
+        self.sessions.insert(remote_addr, session);
+
+        log::info!(
+            "QUIC: outbound Noise_XX handshake complete with {}",
+            remote_addr
+        );
+
+        // Service this connection's future gossip/Kademlia streams the same
+        // way an inbound connection would, on its own task so
+        // `connect_to_peer` can return once the session is registered.
+        let ingress = self.ingress.clone();
+        let kademlia = self.kademlia.clone();
+        let sessions = self.sessions.clone();
+        let frame_drops = self.frame_drops.clone();
+        let relay = self.relay.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = run_native_stream_loop(
+                connection,
+                remote_addr,
+                ingress,
+                kademlia,
+                sessions.clone(),
+                frame_drops,
+                relay,
+            )
+                .await
+            {
+                log::warn!("Outbound QUIC connection to {} ended: {}", remote_addr, e);
+                sessions.remove(&remote_addr);
+            }
+        });
+
+        Ok(())
+    }
 }
 
 // ── Connection handlers ───────────────────────────────────────────────────────
@@ -590,7 +740,28 @@ where
     // response flow will populate the DHT via dht.insert() later.
     // For now, the connection itself is tracked via the sessions map.
 
-    // ── Stream dispatch loop ──────────────────────────────────────────────────
+    run_native_stream_loop(connection, remote_addr, ingress, kademlia, sessions, frame_drops, relay).await
+}
+
+/// Post-handshake stream dispatch loop for a native QUIC connection.
+///
+/// Shared by `handle_native_connection` (inbound, accept side) and
+/// `PrimusNetworkServer::connect_to_peer` (outbound, dial side) — both sides
+/// service gossip uni-streams and Kademlia RPC bi-streams identically once
+/// the Noise_XX handshake and session registration are done.
+async fn run_native_stream_loop<M, K>(
+    connection: Connection,
+    remote_addr: SocketAddr,
+    ingress: Arc<M>,
+    kademlia: Arc<K>,
+    sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
+    frame_drops: Arc<AtomicU64>,
+    relay: Arc<GossipRelay>,
+) -> Result<()>
+where
+    M: MessageIngress,
+    K: KademliaHandler,
+{
     loop {
         tokio::select! {
             uni = connection.accept_uni() => {
