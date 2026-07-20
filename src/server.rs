@@ -38,10 +38,11 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use quinn::{Connection, Endpoint, ServerConfig};
 use sha3::{Digest, Sha3_256};
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::codec::LengthDelimitedCodec;
 use wtransport::Identity;
 
@@ -178,6 +179,59 @@ impl PeerSession {
 
 // ── Gossip Relay ───────────────────────────────────────────────────────────
 
+/// Upper bound on the number of message ids the seen-set remembers.
+/// Once the cap is hit, the oldest entry (by insertion order, tracked
+/// separately in `SeenSet::order` — HashSet iteration order is arbitrary
+/// and must never be used for eviction) is evicted to make room.
+const MAX_SEEN_MESSAGES: usize = 10_000;
+
+/// Bounded, insertion-ordered set of dedup ids. `ids` gives O(1) membership
+/// checks; `order` is the FIFO queue that tells us which id to evict next.
+/// The two are always kept in sync.
+struct SeenSet {
+    ids: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl SeenSet {
+    fn new() -> Self {
+        Self {
+            ids: HashSet::with_capacity(MAX_SEEN_MESSAGES),
+            order: VecDeque::with_capacity(MAX_SEEN_MESSAGES),
+        }
+    }
+
+    /// Records `id` if it hasn't been seen before. Returns `true` if this
+    /// was the first sighting (caller should process/relay), `false` if
+    /// `id` is a duplicate (caller should drop it).
+    fn insert_if_new(&mut self, id: [u8; 32]) -> bool {
+        if !self.ids.insert(id) {
+            return false;
+        }
+
+        // Evict oldest by insertion order, not HashSet iteration order.
+        self.order.push_back(id);
+        if self.order.len() > MAX_SEEN_MESSAGES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+
+        true
+    }
+}
+
+/// Dedup id for a gossip envelope: SHA3-256 of the payload data bytes
+/// ONLY. The TTL field must never be part of this hash — TTL is
+/// decremented on every hop, so hashing it in would make the same message
+/// content compute a different id at each hop and defeat deduplication
+/// entirely.
+fn envelope_dedup_id(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
 /// Re-broadcasts received gossip envelopes to other currently-held peer
 /// sessions, decrementing TTL by one hop. Relay is session-local: it only
 /// fans out to peers we currently have an open QUIC/WebTransport session
@@ -187,16 +241,31 @@ impl PeerSession {
 /// relay path.
 pub struct GossipRelay {
     sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
-    // TODO(next prompt): seen-message dedup cache (e.g. bounded LRU or
-    // bloom filter keyed by a hash of the plaintext envelope). Without it,
-    // a message can bounce back and forth between peers whose session sets
-    // overlap, bounded only by TTL decrementing to 0 rather than by actual
-    // novelty. Add the cache and check/insert it here once that prompt runs.
+    /// Bounded cache of recently-seen message ids, used to stop a gossip
+    /// message from bouncing indefinitely between peers whose session sets
+    /// overlap (previously bounded only by TTL reaching 0).
+    seen: Mutex<SeenSet>,
 }
 
 impl GossipRelay {
     pub fn new(sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>) -> Self {
-        Self { sessions }
+        Self {
+            sessions,
+            seen: Mutex::new(SeenSet::new()),
+        }
+    }
+
+    /// Checks `data` against the seen-set and records it if new.
+    ///
+    /// Returns `true` the first time a given envelope's data is observed
+    /// (caller should ingest and relay it), and `false` on every
+    /// subsequent sighting of the same data, regardless of TTL (caller
+    /// should drop it). Must be called — and its result respected — before
+    /// both `ingress.on_envelope` and `relay()` for a given envelope.
+    pub async fn is_new(&self, data: &[u8]) -> bool {
+        let id = envelope_dedup_id(data);
+        let mut seen = self.seen.lock().await;
+        seen.insert_if_new(id)
     }
 
     /// Relay `data` to every session we currently hold except `from`, with
@@ -734,6 +803,18 @@ where
     // ── Hand off to the application layer ─────────────────────────────────────
     match message {
         crate::network::PrimusMessage::Envelope(data, ttl) => {
+            // Dedup check first: same content re-arriving via a different
+            // relay path (or a loop within our overlapping session sets)
+            // must not be re-ingested or re-relayed, no matter what TTL it
+            // shows up with.
+            if !relay.is_new(&data).await {
+                log::debug!(
+                    "Gossip: duplicate envelope from {} dropped (already seen)",
+                    remote_addr
+                );
+                return Ok(());
+            }
+
             ingress.on_envelope(&data).await.with_context(|| {
                 format!(
                     "Gossip: envelope ingestion failed for payload from {}",
@@ -786,4 +867,94 @@ fn generate_self_signed_cert(domain: &str) -> Result<(
             key_der,
         )),
     ))
+}
+
+// ── Gossip dedup tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod gossip_dedup_tests {
+    use super::*;
+
+    /// The whole point of `envelope_dedup_id`: the same envelope data
+    /// hopping through the network at different TTLs must produce the
+    /// exact same dedup id. If TTL leaked into the hash, every hop would
+    /// look like a brand-new message and dedup would never trigger.
+    #[test]
+    fn dedup_id_is_identical_across_different_ttls() {
+        let data = b"same envelope payload, different hop count".to_vec();
+
+        let hi_ttl_msg = crate::network::PrimusMessage::Envelope(data.clone(), 32);
+        let lo_ttl_msg = crate::network::PrimusMessage::Envelope(data.clone(), 1);
+
+        let id_hi = match &hi_ttl_msg {
+            crate::network::PrimusMessage::Envelope(d, _) => envelope_dedup_id(d),
+        };
+        let id_lo = match &lo_ttl_msg {
+            crate::network::PrimusMessage::Envelope(d, _) => envelope_dedup_id(d),
+        };
+
+        assert_eq!(
+            id_hi, id_lo,
+            "dedup id must depend only on envelope data, never on TTL"
+        );
+    }
+
+    #[test]
+    fn dedup_id_differs_for_different_data() {
+        let id_a = envelope_dedup_id(b"payload a");
+        let id_b = envelope_dedup_id(b"payload b");
+        assert_ne!(id_a, id_b);
+    }
+
+    #[tokio::test]
+    async fn seen_set_flags_first_sighting_new_and_repeat_as_duplicate() {
+        let sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>> = Arc::new(DashMap::new());
+        let relay = GossipRelay::new(sessions);
+
+        let data = b"hello gossip network".to_vec();
+
+        assert!(
+            relay.is_new(&data).await,
+            "first sighting of a message must be treated as new"
+        );
+        assert!(
+            !relay.is_new(&data).await,
+            "second sighting of the same data must be treated as a duplicate"
+        );
+
+        // A different TTL on the same underlying data is still a duplicate,
+        // since dedup only looks at `data`.
+        let same_data_again = data.clone();
+        assert!(
+            !relay.is_new(&same_data_again).await,
+            "identical data must be recognized as duplicate regardless of TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn seen_set_evicts_oldest_on_overflow() {
+        let sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>> = Arc::new(DashMap::new());
+        let relay = GossipRelay::new(sessions);
+
+        // Fill past capacity so the very first id gets evicted.
+        for i in 0..(MAX_SEEN_MESSAGES + 1) {
+            let data = format!("msg-{i}").into_bytes();
+            assert!(relay.is_new(&data).await);
+        }
+
+        // The first message's id should have been evicted, so it is
+        // treated as new again.
+        let first_data = b"msg-0".to_vec();
+        assert!(
+            relay.is_new(&first_data).await,
+            "oldest entry should have been evicted once the cap was exceeded"
+        );
+
+        // A recent message should still be remembered.
+        let recent_data = format!("msg-{}", MAX_SEEN_MESSAGES).into_bytes();
+        assert!(
+            !relay.is_new(&recent_data).await,
+            "recently inserted entries must still be remembered"
+        );
+    }
 }
