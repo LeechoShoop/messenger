@@ -1,0 +1,69 @@
+use crate::noise::NoiseStream;
+use anyhow::Result;
+use crate::peer::PrimusNR;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// A unified stream that handles post-quantum security regardless of the
+/// underlying transport (QUIC vs WebTransport).
+pub struct PrimusTransportStream<S> {
+    pub noise: NoiseStream<S>,
+    pub is_leaf: bool,
+}
+
+/// Unified inbound handler (Part 7.5)
+///
+/// Abstracts away the underlying transport. Performs the mandatory Noise_XX
+/// handshake with ML-DSA-87 identity binding.
+pub async fn handle_inbound<S>(
+    stream: S,
+    is_wasm: bool,
+    noise_static: &[u8],
+    local_nr: &PrimusNR,
+    ml_dsa_sk: &[u8],
+) -> Result<PrimusTransportStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Mandatory Noise handshake occurs INSIDE the transport stream
+    let mut noise =
+        NoiseStream::handshake_responder(stream, noise_static, local_nr, ml_dsa_sk).await?;
+
+    // Enable WASM padding if the client is a browser
+    noise.is_wasm = is_wasm;
+
+    Ok(PrimusTransportStream {
+        noise,
+        is_leaf: is_wasm, // Leaf nodes (WASM/Light Clients) don't route traffic
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod listeners {
+    use super::*;
+    use std::net::SocketAddr;
+    use wtransport::Endpoint as WtEndpoint;
+    use wtransport::ServerConfig as WtServerConfig;
+    use wtransport::endpoint::endpoint_side::Server;
+
+    pub struct WebTransportListener {
+        endpoint: WtEndpoint<Server>,
+    }
+
+    impl WebTransportListener {
+        pub async fn bind(addr: SocketAddr, identity: wtransport::Identity) -> Result<Self> {
+            let config = WtServerConfig::builder()
+                .with_bind_address(addr)
+                .with_identity(&identity)
+                .build();
+            let endpoint = WtEndpoint::server(config)?;
+            Ok(Self { endpoint })
+        }
+
+        pub async fn accept(&self) -> Result<wtransport::Connection> {
+            let incoming = self.endpoint.accept().await;
+            let session_request = incoming.await?;
+            let connection = session_request.accept().await?;
+            Ok(connection)
+        }
+    }
+}
