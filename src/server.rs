@@ -176,6 +176,69 @@ impl PeerSession {
     }
 }
 
+// ── Gossip Relay ───────────────────────────────────────────────────────────
+
+/// Re-broadcasts received gossip envelopes to other currently-held peer
+/// sessions, decrementing TTL by one hop. Relay is session-local: it only
+/// fans out to peers we currently have an open QUIC/WebTransport session
+/// with (the `sessions` table) — it does NOT consult the DHT for a wider
+/// broadcast. Wiring it into both `handle_native_connection` and
+/// `handle_web_connection` keeps QUIC and WebTransport peers on the same
+/// relay path.
+pub struct GossipRelay {
+    sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
+    // TODO(next prompt): seen-message dedup cache (e.g. bounded LRU or
+    // bloom filter keyed by a hash of the plaintext envelope). Without it,
+    // a message can bounce back and forth between peers whose session sets
+    // overlap, bounded only by TTL decrementing to 0 rather than by actual
+    // novelty. Add the cache and check/insert it here once that prompt runs.
+}
+
+impl GossipRelay {
+    pub fn new(sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>) -> Self {
+        Self { sessions }
+    }
+
+    /// Relay `data` to every session we currently hold except `from`, with
+    /// `ttl` decremented by one hop. No-op if `ttl` is already 0 — that
+    /// means this message arrived at its last hop and must not propagate
+    /// further.
+    pub async fn relay(&self, data: &[u8], ttl: u8, from: SocketAddr) {
+        if ttl == 0 {
+            return;
+        }
+        let new_ttl = ttl - 1;
+
+        let message = crate::network::PrimusMessage::Envelope(data.to_vec(), new_ttl);
+        let payload = match bincode::serialize(&message) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("Gossip relay: envelope serialization failed: {}", e);
+                return;
+            }
+        };
+
+        // Snapshot the target set before spawning sends, so a peer that
+        // disconnects mid-fan-out just fails its own send rather than
+        // affecting the others.
+        let targets: Vec<(SocketAddr, Arc<PeerSession>)> = self
+            .sessions
+            .iter()
+            .filter(|entry| *entry.key() != from)
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+
+        for (peer_addr, session) in targets {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                if let Err(e) = session.send_gossip(&payload).await {
+                    log::debug!("Gossip relay: send to {} failed: {}", peer_addr, e);
+                }
+            });
+        }
+    }
+}
+
 // ── PrimusNetworkServer ───────────────────────────────────────────────────────
 
 /// The unified P2P network server for Obsidian Nexus.
@@ -200,6 +263,7 @@ pub struct PrimusNetworkServer<M, K> {
     /// DashMap gives lock-free concurrent reads across stream handlers.
     pub sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
     pub frame_drops: Arc<AtomicU64>,
+    pub relay: Arc<GossipRelay>,
 }
 
 impl<M, K> PrimusNetworkServer<M, K>
@@ -260,6 +324,9 @@ where
             }
         };
 
+        let sessions = Arc::new(DashMap::new());
+        let relay = Arc::new(GossipRelay::new(sessions.clone()));
+
         Ok(Self {
             endpoint,
             wt_listener,
@@ -269,8 +336,9 @@ where
             local_nr,
             noise_static,
             ml_dsa_sk,
-            sessions: Arc::new(DashMap::new()),
+            sessions,
             frame_drops: Arc::new(AtomicU64::new(0)),
+            relay,
         })
     }
 
@@ -300,6 +368,7 @@ where
         let sessions = self.sessions.clone();
         let frame_drops = self.frame_drops.clone();
         let dht = self.dht.clone();
+        let relay = self.relay.clone();
 
         // ── QUIC accept loop ──────────────────────────────────────────────────
         let quic_endpoint = self.endpoint.clone();
@@ -310,6 +379,7 @@ where
         let quic_sessions = sessions.clone();
         let quic_frame_drops = frame_drops.clone();
         let quic_dht = dht.clone();
+        let quic_relay = relay.clone();
 
         tokio::spawn(async move {
             while let Some(incoming) = quic_endpoint.accept().await {
@@ -320,6 +390,7 @@ where
                 let s = quic_sessions.clone();
                 let fd = quic_frame_drops.clone();
                 let _d = quic_dht.clone();
+                let r = quic_relay.clone();
 
                 tokio::spawn(async move {
                     match incoming.await {
@@ -334,6 +405,7 @@ where
                                 s,
                                 fd,
                                 _d,
+                                r,
                             )
                                 .await
                             {
@@ -359,6 +431,7 @@ where
                             let s = sessions.clone();
                             let fd = frame_drops.clone();
                             let _d = dht.clone();
+                            let r = relay.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = handle_web_connection(
@@ -371,6 +444,7 @@ where
                                     s,
                                     fd,
                                     _d,
+                                    r,
                                 )
                                     .await
                                 {
@@ -406,6 +480,7 @@ async fn handle_native_connection<M, K>(
     frame_drops: Arc<AtomicU64>,
 
     _dht: PrimusDHT,
+    relay: Arc<GossipRelay>,
 ) -> Result<()>
 where
     M: MessageIngress,
@@ -456,10 +531,11 @@ where
                 let session = s.get(&remote_addr).map(|r| r.value().clone());
                 let connection_clone = connection.clone();
                 let fd = frame_drops.clone();
+                let r = relay.clone();
                 tokio::spawn(async move {
                     if let Some(sess) = session {
                         let _permit = sess.stream_semaphore.acquire().await;
-                        if let Err(e) = handle_gossip_stream(recv, m, s.clone(), remote_addr, fd).await {
+                        if let Err(e) = handle_gossip_stream(recv, m, s.clone(), remote_addr, fd, r).await {
                             log::warn!("Gossip stream error from {}: {} — closing connection", remote_addr, e);
                             // INVARIANT: Decrypt failures cause nonce desync. The connection must
                             // be closed immediately so the next message from this peer uses a new handshake.
@@ -498,6 +574,7 @@ async fn handle_web_connection<M, K>(
     frame_drops: Arc<AtomicU64>,
 
     _dht: PrimusDHT,
+    relay: Arc<GossipRelay>,
 ) -> Result<()>
 where
     M: MessageIngress,
@@ -554,10 +631,11 @@ where
                 let session = s.get(&remote_addr).map(|r| r.value().clone());
                 let arc_conn_c = arc_conn.clone();
                 let fd = frame_drops.clone();
+                let r = relay.clone();
                 tokio::spawn(async move {
                     if let Some(sess) = session {
                         let _permit = sess.stream_semaphore.acquire().await;
-                        if let Err(e) = handle_gossip_stream(recv, m, s.clone(), remote_addr, fd).await {
+                        if let Err(e) = handle_gossip_stream(recv, m, s.clone(), remote_addr, fd, r).await {
                             log::warn!("WebTransport gossip error from {}: {} — closing connection", remote_addr, e);
                             s.remove(&remote_addr);
                             arc_conn_c.close(0u32.into(), b"nonce error");
@@ -591,6 +669,7 @@ async fn handle_gossip_stream<R, M>(
     sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
     remote_addr: SocketAddr,
     frame_drops: Arc<AtomicU64>,
+    relay: Arc<GossipRelay>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -654,13 +733,23 @@ where
 
     // ── Hand off to the application layer ─────────────────────────────────────
     match message {
-        crate::network::PrimusMessage::Envelope(data, _ttl) => {
+        crate::network::PrimusMessage::Envelope(data, ttl) => {
             ingress.on_envelope(&data).await.with_context(|| {
                 format!(
                     "Gossip: envelope ingestion failed for payload from {}",
                     remote_addr
                 )
             })?;
+
+            // Relay to other currently-held peer sessions after successful
+            // ingestion only — a peer whose payload failed application-level
+            // ingestion shouldn't still get propagated further. Spawned so a
+            // slow or stuck peer in the fan-out doesn't hold up this stream's
+            // handler.
+            let relay_data = data.clone();
+            tokio::spawn(async move {
+                relay.relay(&relay_data, ttl, remote_addr).await;
+            });
         }
         _ => {
             log::debug!(
