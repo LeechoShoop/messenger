@@ -14,8 +14,8 @@
 //
 // on_envelope CONTRACT (per server.rs's MessageIngress trait + this prompt):
 //   Ok(true)  — new message, deserialized and stored.
-//   Ok(false) — well-formed envelope, but its `id` was already in the
-//               store (application-level duplicate — see envelope.rs's
+//   Ok(false) — well-formed envelope, but its `message_id` was already in
+//               the store (application-level duplicate — see envelope.rs's
 //               module doc comment on how this differs from the network
 //               layer's relay dedup).
 //   Err(_)    — bytes did not deserialize as `Envelope`. server.rs wraps
@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 
 use messenger::server::MessageIngress;
 
-pub use envelope::{Envelope, MessageId, StoredMessage};
+pub use envelope::{Envelope, MessageId, MessageKind, NodeId, StoredMessage};
 
 /// Application core: owns the in-memory message store and implements
 /// `MessageIngress` so it can be plugged into `PrimusNetworkServer`.
@@ -81,15 +81,15 @@ impl MessageIngress for MessengerCore {
 
         let mut store = self.store.lock().await;
 
-        if store.contains_key(&envelope.id) {
+        if store.contains_key(&envelope.message_id) {
             log::debug!(
                 "MessengerCore: duplicate message {} dropped (already stored)",
-                hex_short(&envelope.id)
+                hex_short(&envelope.message_id)
             );
             return Ok(false);
         }
 
-        let id = envelope.id;
+        let id = envelope.message_id;
         store.insert(id, StoredMessage { envelope });
 
         log::info!("MessengerCore: stored new message {}", hex_short(&id));
@@ -107,10 +107,12 @@ mod tests {
 
     fn sample_envelope(id: u8) -> Envelope {
         Envelope {
-            id: [id; 32],
-            sender: [0xAB; 32],
-            timestamp: 0,
-            payload: vec![1, 2, 3],
+            message_id: [id; 32],
+            sender_node_id: [0xAB; 32],
+            recipient_node_id: [0xCD; 32],
+            ciphertext: vec![1, 2, 3], // TODO(e2e): plaintext stub, see envelope.rs
+            sent_at: 0,
+            kind: MessageKind::DirectMessage,
         }
     }
 
@@ -131,16 +133,16 @@ mod tests {
         let core = MessengerCore::new();
         let first = bincode::serialize(&sample_envelope(2)).unwrap();
         let mut second_env = sample_envelope(2);
-        second_env.payload = vec![9, 9, 9]; // different content, same id
+        second_env.ciphertext = vec![9, 9, 9]; // different content, same id
         let second = bincode::serialize(&second_env).unwrap();
 
         assert!(core.on_envelope(&first).await.unwrap());
         assert!(!core.on_envelope(&second).await.unwrap());
 
         assert_eq!(core.len().await, 1);
-        // Original payload preserved — duplicate does not overwrite.
+        // Original ciphertext preserved — duplicate does not overwrite.
         let stored = core.get(&[2u8; 32]).await.unwrap();
-        assert_eq!(stored.envelope.payload, vec![1, 2, 3]);
+        assert_eq!(stored.envelope.ciphertext, vec![1, 2, 3]);
     }
 
     #[tokio::test]

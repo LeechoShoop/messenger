@@ -1,57 +1,67 @@
 // =============================================================================
 // messenger-core/src/envelope.rs — Application-level message schema
 //
-// HONEST GAP: prompt 12's `Envelope` definition wasn't in context for this
-// prompt (only dht.rs, lib.rs, noise.rs, server.rs, bootstrap.rs, discovery.rs,
-// main.rs, nat.rs, network.rs, peer.rs, transport.rs, Cargo.toml were
-// available). What's below is a minimal, reasonable reconstruction —
-// reconcile field-for-field against the actual prompt 12 output before
-// relying on wire compatibility between nodes.
-//
-// SCOPE NOTE — two different "duplicate" checks, deliberately separate:
-//   - server.rs's `relay.is_new(&data)` hashes the *raw opaque bytes* on the
-//     gossip stream. That's transport-level relay-loop suppression: don't
-//     re-relay/re-ingest identical ciphertext-adjacent bytes seen before.
-//   - `MessageId` here is a field *inside* the deserialized Envelope,
-//     assigned by the sender. This is an application-level idempotency
-//     key: two envelopes with the same `id` are semantically "the same
-//     message" even if their serialized bytes differ (e.g. re-sent with a
-//     refreshed TTL). MessengerCore dedups on this, independent of and
-//     downstream from the network layer's check.
+// Deliberately minimal for now: no read receipts, no group messaging.
+// Extend once 1:1 delivery works end to end.
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
 
-/// Application-level message identifier, assigned by the sender at
-/// creation time. 32 bytes to line up with the NodeID / SHA3-256 sizing
-/// used throughout primus-net-opt (dht.rs, peer.rs) — not itself a hash of
-/// anything here, just a fixed-size opaque ID.
+/// Sender-assigned idempotency key. 32 bytes to line up with NodeID sizing
+/// used throughout primus-net-opt (dht.rs, peer.rs). May be random or
+/// content-derived (e.g. hash of ciphertext + sender + sent_at) — callers
+/// decide; this type doesn't enforce either.
 pub type MessageId = [u8; 32];
+
+/// Matches `messenger::dht::NodeID` / `PrimusNR::node_id()`'s output shape
+/// (SHA3-256 of the peer's ML-DSA-87 public key). Kept as a raw `[u8; 32]`
+/// rather than re-exporting `messenger::NodeID` directly, so this schema
+/// doesn't shift silently if that type's definition ever moves.
+pub type NodeId = [u8; 32];
+
+/// What kind of application message this envelope carries. Presence and
+/// delivery-receipt variants are declared now so the wire schema doesn't
+/// need to change shape when those features land — their payload
+/// conventions (what goes in `ciphertext` for each) aren't defined yet.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum MessageKind {
+    DirectMessage,
+    DeliveryReceipt,
+    PresenceUpdate,
+}
 
 /// The application envelope carried inside `network::PrimusMessage::Envelope`'s
 /// opaque `data` field. The network layer never inspects these bytes; this
 /// is the first point in the stack that does.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Envelope {
-    /// Sender-assigned idempotency key. See module doc comment.
-    pub id: MessageId,
+    /// Sender-assigned idempotency key. See type doc comment.
+    pub message_id: MessageId,
 
-    /// Sender's Kademlia NodeID (`messenger::NodeID`, i.e. SHA3-256 of
-    /// their ML-DSA-87 public key — see peer.rs). Kept as a raw
-    /// `[u8; 32]` here rather than re-exporting `messenger::NodeID`
-    /// directly, so this schema doesn't shift silently if that type's
-    /// definition ever moves.
-    pub sender: [u8; 32],
+    /// Sender's Kademlia NodeID.
+    pub sender_node_id: NodeId,
 
-    /// Unix epoch milliseconds at creation. Not currently used for
-    /// expiry/ordering by MessengerCore — stored for later use (e.g. a
-    /// prompt-18 persistence layer wanting to prune or sort by age).
-    pub timestamp: u64,
+    /// Intended recipient's Kademlia NodeID. Not used for routing at this
+    /// layer — routing/relay is the network layer's job (gossip TTL in
+    /// network.rs) — this is here so MessengerCore can filter "is this
+    /// envelope addressed to me" once relay isn't purely broadcast.
+    pub recipient_node_id: NodeId,
 
-    /// Opaque message content. Whatever end-to-end encryption or plaintext
-    /// framing applies above this layer is out of scope here — MessengerCore
-    /// stores it as-is.
-    pub payload: Vec<u8>,
+    /// End-to-end encrypted payload.
+    ///
+    /// TODO(e2e): the actual E2E encryption layer (key agreement, AEAD
+    /// scheme, associated data) is out of scope for this prompt and not
+    /// designed yet. For now this field is a stub: plaintext bytes wrapped
+    /// as-is, with no encryption applied. Do NOT treat this as
+    /// confidential until that layer exists — Noise_XX (noise.rs) protects
+    /// the transport hop, not this field at rest or across relay hops.
+    pub ciphertext: Vec<u8>,
+
+    /// Unix epoch seconds at creation.
+    pub sent_at: u64,
+
+    /// What kind of message this is. See `MessageKind` doc comment.
+    pub kind: MessageKind,
 }
 
 /// What MessengerCore keeps per accepted message. Currently just the
