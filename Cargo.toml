@@ -1,0 +1,3 @@
+[workspace]
+members = ["messenger", "messenger-core"]
+resolver = "2"

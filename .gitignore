@@ -1,0 +1,85 @@
+/target
+messenger/.idea/
+# =============================================================================
+# primus workspace — .gitignore
+# Place at C:\Users\shoop\RustroverProjects\primus\.gitignore (workspace root)
+# =============================================================================
+
+# ── Build artifacts ──────────────────────────────────────────────────────
+# Single shared target/ at workspace root now that messenger + messenger-core
+# are workspace members. If either sub-crate still has its own target/ or
+# Cargo.lock left over from before the merge, these patterns catch those too.
+/target/
+**/target/
+messenger/target/
+messenger-core/target/
+
+# Cargo.lock: for a workspace producing binaries (messenger has a main.rs),
+# convention is to commit the root Cargo.lock for reproducible builds.
+# Ignoring the per-crate ones only — those are stale leftovers from when
+# each crate was standalone and will conflict with the workspace-level lock.
+messenger/Cargo.lock
+messenger-core/Cargo.lock
+# If you'd rather not commit any lockfile at all (fine for a lib-only
+# workspace, less fine once messenger's binary matters for reproducibility),
+# uncomment instead:
+# /Cargo.lock
+
+# ── RustRover / IntelliJ ─────────────────────────────────────────────────
+.idea/
+*.iml
+messenger-core/.idea/
+
+# ── Editor / OS cruft ────────────────────────────────────────────────────
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Env / local config ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Node secrets — CRITICAL, do not relax these ─────────────────────────
+# main.rs's GAP #1 (key persistence) means identity keys will eventually be
+# written to disk here. When that lands, whatever path it uses must match
+# one of these patterns before it's wired up — not after.
+*.key
+*.pem
+*.p8
+*.pfx
+*.der
+identity.bin
+identity.json
+node_identity*
+*_sk.bin
+*.secret
+
+# CA / TLS material (same pattern as Cogitator's vault.rs-style handling —
+# private keys and passphrase-encrypted blobs never belong in git)
+ca_key*
+ca_cert*
+*.p12
+
+# bootstrap.rs seed files, if they ever carry non-public infra addresses
+seeds.txt
+seeds.local.txt
+PRIMUS_SEEDS*
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Test / fuzz / coverage output ───────────────────────────────────────
+/fuzz/target/
+*.profraw
+tarpaulin-report.html
+cobertura.xml
+
+# ── Misc build tool output ──────────────────────────────────────────────
+/target-*
+*.pdb
