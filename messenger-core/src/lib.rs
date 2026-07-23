@@ -24,8 +24,15 @@
 //               error but does not tear down the session or crash the
 //               node — a malformed envelope from one peer must not take
 //               the node down.
+//
+// SEND PATH: `delivery::send_direct_message` (new this prompt) is the
+// outbound counterpart to `on_envelope`'s inbound path — see delivery.rs
+// for the routing strategy (direct session reuse -> dial -> gossip-relay
+// fallback) and why it's a free function rather than a `MessengerCore`
+// method.
 // =============================================================================
 
+pub mod delivery;
 pub mod envelope;
 
 use std::collections::HashMap;
@@ -36,6 +43,7 @@ use tokio::sync::Mutex;
 
 use messenger::server::MessageIngress;
 
+pub use delivery::{send_direct_message, DeliveryResult};
 pub use envelope::{Envelope, MessageId, MessageKind, NodeId, StoredMessage};
 
 /// Application core: owns the in-memory message store and implements
