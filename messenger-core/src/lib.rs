@@ -26,7 +26,7 @@
 //               `ReceiptPayload`). server.rs logs and drops on Err without
 //               tearing down the session.
 //
-// DELIVERY RECEIPTS (this prompt):
+// DELIVERY RECEIPTS:
 //   - Inbound `DirectMessage`, newly stored -> `queue_receipt` builds a
 //     `DeliveryReceipt` envelope and hands it to `outbound_tx`. See
 //     outbound.rs for why this is a channel handoff rather than a direct
@@ -39,11 +39,29 @@
 //     `queue_receipt`. This isn't a runtime check that could be forgotten
 //     under some condition — receipts structurally never reach the code
 //     path that queues a receipt, full stop.
+//
+// PENDING OUTBOX (this prompt):
+//   `outbound::send_tracked_message` and `outbound::run_outbound_dispatch`
+//   used to just log and drop an envelope when `send_direct_message`
+//   returned `DeliveryResult::Failed`. Both now push it into
+//   `self.outbox` (a `PendingOutbox`, see pending_outbox.rs) instead. A
+//   separately-spawned background task, `pending_outbox::run_retry_loop`,
+//   wakes up every `RETRY_INTERVAL` and retries anything queued whose
+//   recipient has since become resolvable in the local DHT, up to
+//   `MAX_RETRY_AGE` before giving up and calling `mark_failed` on it. See
+//   pending_outbox.rs's module doc comment for the full design (why
+//   retries are gated on DHT visibility, the per-recipient cap/eviction
+//   policy, and lock discipline). Wiring: `MessengerCore::new` builds the
+//   outbox internally; `outbox()` hands out a clone of the `Arc` for
+//   whoever constructs the server to spawn the retry loop alongside
+//   `run_outbound_dispatch` — see that function's wiring comment for the
+//   updated example.
 // =============================================================================
 
 pub mod delivery;
 pub mod envelope;
 pub mod outbound;
+pub mod pending_outbox;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,6 +77,10 @@ pub use envelope::{
     DeliveryStatus, Envelope, MessageId, MessageKind, NodeId, ReceiptPayload, StoredMessage,
 };
 pub use outbound::{run_outbound_dispatch, send_tracked_message, OutboundReceiver, PendingSend};
+pub use pending_outbox::{
+    run_retry_loop, run_retry_pass, PendingOutbox, MAX_PENDING_PER_RECIPIENT, MAX_RETRY_AGE,
+    RETRY_INTERVAL,
+};
 
 /// Application core: owns the in-memory message store and implements
 /// `MessageIngress` so it can be plugged into `PrimusNetworkServer`.
@@ -70,6 +92,14 @@ pub struct MessengerCore {
     /// before this prompt — construction now requires it explicitly.
     local_node_id: NodeId,
     outbound_tx: outbound::OutboundSender,
+    /// Retry queue for envelopes that came back `Failed` from
+    /// `send_direct_message`. Shared (not owned exclusively) because the
+    /// background retry loop (`pending_outbox::run_retry_loop`) needs its
+    /// own `Arc` alongside the server `Arc` — same reason `MessengerCore`
+    /// can't hold the server itself (see delivery.rs's / outbound.rs's
+    /// notes on the Arc-cycle this crate consistently avoids). Get a
+    /// clone via `outbox()`.
+    outbox: Arc<pending_outbox::PendingOutbox>,
 }
 
 impl MessengerCore {
@@ -92,9 +122,20 @@ impl MessengerCore {
                 store: Arc::new(Mutex::new(HashMap::new())),
                 local_node_id,
                 outbound_tx,
+                outbox: Arc::new(pending_outbox::PendingOutbox::new()),
             },
             outbound_rx,
         )
+    }
+
+    /// Clone of the shared retry-queue handle. Hand this to
+    /// `pending_outbox::run_retry_loop` (spawned alongside
+    /// `outbound::run_outbound_dispatch` — see that function's wiring
+    /// comment) so the background retry loop and this `MessengerCore`
+    /// operate on the same outbox. Cheap: `PendingOutbox` is stored
+    /// behind an `Arc`, so this is a refcount bump, not a deep copy.
+    pub fn outbox(&self) -> Arc<pending_outbox::PendingOutbox> {
+        Arc::clone(&self.outbox)
     }
 
     /// Look up a previously-ingested or self-originated message by ID.

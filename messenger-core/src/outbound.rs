@@ -18,16 +18,28 @@
 // constructed):
 //
 //   let (core, outbound_rx) = MessengerCore::new(local_node_id);
-//   let ingress = Arc::new(core);
-//   let server = Arc::new(PrimusNetworkServer::new(..., ingress.clone(), ...).await?);
+//   let core = Arc::new(core);
+//   let server = Arc::new(PrimusNetworkServer::new(..., Arc::clone(&core), ...).await?);
 //   tokio::spawn(messenger_core::outbound::run_outbound_dispatch(
 //       Arc::clone(&server),
 //       outbound_rx,
+//       core.outbox(),
+//   ));
+//   tokio::spawn(messenger_core::pending_outbox::run_retry_loop(
+//       Arc::clone(&server),
+//       Arc::clone(&core),
+//       core.outbox(),
 //   ));
 //
-//   `ingress` and `server` can then be used as before — `run_outbound_dispatch`
-//   just needs its own clone of the server Arc, same pattern as
-//   `bootstrap::bootstrap` in the messenger crate.
+//   `core` is now wrapped in its own `Arc` up front, before being handed
+//   to `PrimusNetworkServer::new` as `ingress` (still `M = MessengerCore`,
+//   same as before — `PrimusNetworkServer` stores ingress as `Arc<M>`
+//   internally, so passing `Arc::clone(&core)` there is exactly what the
+//   old `let ingress = Arc::new(core);` line did, just from a shared
+//   binding instead of a one-off). The one actual change is *why* it's
+//   shared: `run_outbound_dispatch` and `run_retry_loop` both need their
+//   own clone of `core` (for `mark_failed`) and `core.outbox()` (for the
+//   retry queue) alongside their clone of `server`.
 // =============================================================================
 
 use std::sync::Arc;
@@ -39,6 +51,7 @@ use messenger::server::{KademliaHandler, MessageIngress, PrimusNetworkServer};
 
 use crate::delivery::{self, DeliveryResult};
 use crate::envelope::{Envelope, MessageKind};
+use crate::pending_outbox::PendingOutbox;
 use crate::MessengerCore;
 
 /// One outbound send `MessengerCore` couldn't perform itself — currently
@@ -61,13 +74,23 @@ pub type OutboundSender = mpsc::UnboundedSender<PendingSend>;
 /// stop signal needed.
 ///
 /// Receipts are fire-and-forget from `on_envelope`'s point of view: this
-/// loop logs the outcome but there's no caller left to hand a
-/// `DeliveryResult` back to. If a receipt's send fails, the sender simply
-/// never sees their message move to `Delivered` — no retry is attempted
-/// here (retries are a reasonable future addition, not built now).
+/// loop logs the outcome, and there's no caller left to hand a
+/// `DeliveryResult` back to directly. What used to be a dead end on
+/// `Failed` (message just dropped) now pushes into `outbox` instead —
+/// `pending_outbox::run_retry_loop` (spawned separately, see this
+/// module's wiring comment) will retry it once the recipient becomes
+/// resolvable in the local DHT. A receipt that keeps failing simply ages
+/// out of the outbox after `pending_outbox::MAX_RETRY_AGE`; there's still
+/// no confirmation path back to whatever originally triggered the
+/// receipt (`MessengerCore::queue_receipt`'s caller already returned).
+///
+/// BREAKING CHANGE (this prompt): takes a third parameter, `outbox`, for
+/// exactly this purpose. Existing callers need `core.outbox()` added to
+/// their spawn call — see the updated wiring example above.
 pub async fn run_outbound_dispatch<M, K>(
     server: Arc<PrimusNetworkServer<M, K>>,
     mut outbound_rx: OutboundReceiver,
+    outbox: Arc<PendingOutbox>,
 ) where
     M: MessageIngress,
     K: KademliaHandler,
@@ -80,6 +103,9 @@ pub async fn run_outbound_dispatch<M, K>(
     {
         let kind = envelope.kind.clone();
         let message_id = envelope.message_id;
+        // Clone before the call: send_direct_message consumes `envelope`,
+        // but a `Failed` result needs the envelope back to queue it.
+        let retry_copy = envelope.clone();
         let result = delivery::send_direct_message(&server, recipient_node_id, envelope).await;
         log::debug!(
             "Outbound dispatch: {:?} {} -> {:?}",
@@ -87,6 +113,9 @@ pub async fn run_outbound_dispatch<M, K>(
             hex_short(&message_id),
             result
         );
+        if result == DeliveryResult::Failed {
+            outbox.push(recipient_node_id, retry_copy).await;
+        }
     }
     log::info!("Outbound dispatch: channel closed, exiting");
 }
@@ -106,6 +135,16 @@ pub async fn run_outbound_dispatch<M, K>(
 /// wires the receiving side (`on_envelope`) plus this ready-made sending
 /// entry point; nothing yet calls it, since no message-composition layer
 /// exists in messenger-core as of this prompt.
+///
+/// On `Failed`, the envelope is pushed into `core.outbox()` for retry
+/// (see pending_outbox.rs) in addition to the existing `mark_failed` call
+/// — the two aren't redundant: `mark_failed` is the *immediate* status a
+/// caller sees right now (`DeliveryStatus::Failed`), while the outbox
+/// keeps trying in the background and will flip the status again via a
+/// later `DeliveryReceipt` if a retry actually lands. If the outbox
+/// itself eventually gives up (age cap reached), it calls `mark_failed`
+/// again — a no-op status-wise, since it's already `Failed`, but that's
+/// also where the "give up for real" log line comes from.
 pub async fn send_tracked_message<M, K>(
     core: &MessengerCore,
     server: &Arc<PrimusNetworkServer<M, K>>,
@@ -122,10 +161,16 @@ where
     }
 
     let message_id = envelope.message_id;
+    // Clone before the call: send_direct_message consumes `envelope`, but
+    // a `Failed` result needs the envelope back to queue it for retry.
+    let retry_copy = envelope.clone();
     let result = delivery::send_direct_message(server, recipient_node_id, envelope).await;
 
-    if is_direct_message && result == DeliveryResult::Failed {
-        core.mark_failed(&message_id).await;
+    if result == DeliveryResult::Failed {
+        if is_direct_message {
+            core.mark_failed(&message_id).await;
+        }
+        core.outbox().push(recipient_node_id, retry_copy).await;
     }
 
     result
