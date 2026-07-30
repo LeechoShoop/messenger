@@ -32,6 +32,8 @@ pub mod noise;
 pub mod peer;
 pub mod server;
 pub mod transport;
+pub mod identity;
+pub mod dht_snapshot;
 
 pub use dht::{K as BUCKET_SIZE, NodeID, PrimusDHT, RoutingTable, xor_distance};
 pub use noise::{BiStream, NOISE_PATTERN, NoiseStream};

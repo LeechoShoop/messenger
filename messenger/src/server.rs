@@ -43,8 +43,10 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::codec::LengthDelimitedCodec;
@@ -144,6 +146,122 @@ pub enum PrimusConnection {
     Web(Arc<wtransport::Connection>),
 }
 
+// ── Per-peer gossip rate limiter ──────────────────────────────────────────────
+
+/// Sustained gossip envelopes/sec allowed from a single peer before frames
+/// start getting dropped. Deliberately separate from `stream_semaphore`
+/// (which bounds *concurrent tasks*, not *arrival rate* — a peer opening
+/// streams slower than the semaphore cap but faster than any reasonable
+/// application need would sail right through it).
+const GOSSIP_RATE_SUSTAINED_PER_SEC: f64 = 100.0;
+
+/// Burst capacity: how many envelopes a peer can send in a sudden spike
+/// before the sustained rate starts throttling it. Also the bucket's
+/// starting/maximum token count.
+const GOSSIP_RATE_BURST: f64 = 20.0;
+
+/// Minimal token-bucket rate limiter. No external dependency (e.g.
+/// `governor`) pulled in for this — a two-field bucket refilled against
+/// elapsed wall-clock time is all `handle_gossip_stream`'s per-peer check
+/// needs, and it matches the hand-rolled style already used for `SeenSet`
+/// elsewhere in this file.
+///
+/// Callers own one per peer (see `PeerSession::gossip_rate_limiter`)
+/// guarded by a `Mutex`, since refill + consume must happen atomically
+/// together.
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_sec,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill based on elapsed time, then attempt to consume one token.
+    /// Returns `true` if a token was available (caller may proceed),
+    /// `false` if the peer is currently over its rate (caller should drop
+    /// the frame, not queue it).
+    fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ── Nonce exhaustion + session max-age policy ─────────────────────────────────
+//
+// Two independent reasons a `PeerSession` gets torn down proactively,
+// distinct from an ordinary error-driven disconnect (bad frame, decrypt
+// failure, peer hangup):
+//
+//   1. NONCE EXHAUSTION: `recv_nonce`/`send_nonce` are `u64` counters fed
+//      directly to Noise as message nonces. Noise's security proof
+//      requires every (key, nonce) pair to be used at most once — if a
+//      counter ever wrapped back to a previously-used value under the
+//      same transport keys, that would silently break confidentiality
+//      and authentication for both the reused message and potentially
+//      others. At any realistic message rate this counter will never
+//      get remotely close to `u64::MAX` (sending a billion messages a
+//      second would still take ~584 years), but "we checked and refused
+//      to wrap" is a categorically safer invariant to ship than "we
+//      assumed it could never happen" — cheap to check, and the failure
+//      mode if we're ever wrong is silent crypto weakness, not a crash.
+//
+//   2. SESSION MAX AGE: independent of nonce exhaustion, keeping the same
+//      Noise transport keys open indefinitely is its own (much more
+//      mundane) exposure — no forward secrecy from key rotation, and a
+//      compromised key stays useful to an attacker for as long as the
+//      session lives. Rotating proactively after `max_age` bounds that
+//      window regardless of how much traffic (or how little) the session
+//      has actually carried.
+//
+// Both paths converge on `PeerSession::evict`, but log distinctly *before*
+// calling it, so an operator scanning logs can tell "this closed because
+// the nonce counter hit its safety margin" apart from "this closed
+// because it aged out" apart from "this closed because something actually
+// went wrong" (the pre-existing `Gossip stream error from ... — closing
+// connection` / `nonce error` reason-string path elsewhere in this file).
+
+/// Once either nonce counter comes within this many values of `u64::MAX`,
+/// the session is forcibly torn down rather than risking a wraparound
+/// reuse. See the module-level comment above for why this is checked at
+/// all given how astronomically unlikely it is to trigger.
+const NONCE_EXHAUSTION_MARGIN: u64 = 1 << 32; // ~4.29 billion
+
+/// Default max age of an open `PeerSession` before it's proactively
+/// rotated — connection closed, session evicted — independent of whether
+/// any traffic has crossed it. Overridable via the
+/// `PRIMUS_SESSION_MAX_AGE_SECS` env var (seconds), following the same
+/// env-var-configurability convention `bootstrap.rs` uses for seed
+/// addresses, rather than threading a parameter through every
+/// `PeerSession::new` call site.
+const DEFAULT_SESSION_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn configured_session_max_age() -> Duration {
+    std::env::var("PRIMUS_SESSION_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SESSION_MAX_AGE)
+}
+
 /// Per-connection session state shared across stream handlers.
 ///
 /// `recv_nonce` is incremented atomically after each successfully decrypted
@@ -155,10 +273,42 @@ pub struct PeerSession {
     pub send_nonce: AtomicU64,
     /// Limit concurrent streams from this peer to prevent task flooding.
     pub stream_semaphore: Arc<Semaphore>,
+    /// Per-source-peer gossip rate limit (see `GOSSIP_RATE_SUSTAINED_PER_SEC`
+    /// / `GOSSIP_RATE_BURST`). Checked in `handle_gossip_stream` before a
+    /// frame is decrypted or handed to `ingress`/`relay` — a peer over its
+    /// rate gets its frame dropped with a `warn` log, not buffered, so a
+    /// flooding peer can't build an unbounded queue or consume the relay
+    /// fan-out semaphore on our behalf.
+    gossip_rate_limiter: Mutex<TokenBucket>,
+    /// This session's key in the shared session table — needed so
+    /// `evict()` knows which entry to remove from `sessions` below.
+    remote_addr: SocketAddr,
+    /// Weak back-reference to the shared session table. Deliberately
+    /// `Weak`, not `Arc`: the table holds `Arc<PeerSession>` entries, so a
+    /// strong back-reference here (`Arc<DashMap<...>>` pointing right back
+    /// at the map that owns this session) would be a real reference cycle
+    /// — table -> session -> table — not just a shared-ownership
+    /// convenience. `Weak` lets a session evict itself from the table
+    /// without keeping the table itself alive past its own owner's
+    /// lifetime.
+    sessions: Weak<DashMap<SocketAddr, Arc<PeerSession>>>,
+    /// When this session's Noise handshake completed. Used only for the
+    /// max-age policy (see `spawn_max_age_reaper`) and its log line.
+    created_at: Instant,
+    /// This session's configured max age. Captured once at construction
+    /// (from `configured_session_max_age()`) rather than re-read from the
+    /// env on every check, so a session's lifetime policy can't change out
+    /// from under it mid-life if the env var were ever changed at runtime.
+    max_age: Duration,
 }
 
 impl PeerSession {
-    pub fn new(conn: PrimusConnection, noise: snow::StatelessTransportState) -> Self {
+    pub fn new(
+        conn: PrimusConnection,
+        noise: snow::StatelessTransportState,
+        remote_addr: SocketAddr,
+        sessions: &Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
+    ) -> Self {
         Self {
             conn,
             noise,
@@ -166,7 +316,92 @@ impl PeerSession {
             send_nonce: AtomicU64::new(0),
             // Max 100 concurrent streams per connection.
             stream_semaphore: Arc::new(Semaphore::new(100)),
+            gossip_rate_limiter: Mutex::new(TokenBucket::new(
+                GOSSIP_RATE_BURST,
+                GOSSIP_RATE_SUSTAINED_PER_SEC,
+            )),
+            remote_addr,
+            sessions: Arc::downgrade(sessions),
+            created_at: Instant::now(),
+            max_age: configured_session_max_age(),
         }
+    }
+
+    /// Forcibly tear this session down: close the underlying transport
+    /// connection and remove it from the shared session table (if the
+    /// table is still alive — see the `sessions` field's doc comment for
+    /// why it's `Weak`). Safe to call more than once or alongside a
+    /// caller's own cleanup on an `Err` return (nonce-exhaustion detection
+    /// inside `decrypt`/`send_gossip` still returns `Err` after evicting,
+    /// so existing error-handling call sites run too) — `DashMap::remove`
+    /// on an already-removed key is a no-op, and closing an
+    /// already-closed `quinn`/`wtransport` connection is a no-op on both
+    /// of those types as well.
+    fn evict(&self, reason: &'static [u8]) {
+        match &self.conn {
+            PrimusConnection::Quic(conn) => conn.close(0u32.into(), reason),
+            PrimusConnection::Web(conn) => conn.close(0u32.into(), reason),
+        }
+        if let Some(sessions) = self.sessions.upgrade() {
+            sessions.remove(&self.remote_addr);
+        }
+    }
+
+    /// If `nonce` has come within `NONCE_EXHAUSTION_MARGIN` of
+    /// `u64::MAX`, log distinctly, evict this session, and return `true`.
+    /// `direction` is purely for the log line ("recv" or "send") — the
+    /// two counters are independent and either can trip this first.
+    fn check_nonce_exhaustion(&self, nonce: u64, direction: &str) -> bool {
+        if nonce < u64::MAX - NONCE_EXHAUSTION_MARGIN {
+            return false;
+        }
+        log::error!(
+            "SECURITY: {} nonce counter for session {} is approaching exhaustion \
+             (nonce={}, within {} of u64::MAX) — forcibly closing the connection and \
+             evicting the session rather than risk nonce reuse on wraparound. This is \
+             expected to be unreachable in practice; if this fires, treat it as a \
+             signal something upstream is generating traffic at an abnormal rate.",
+            direction,
+            self.remote_addr,
+            nonce,
+            NONCE_EXHAUSTION_MARGIN
+        );
+        self.evict(b"nonce exhaustion");
+        true
+    }
+
+    /// Spawn a background task that proactively tears this session down —
+    /// closes the connection and evicts it from the session table — once
+    /// `max_age` has elapsed, regardless of whether any traffic has
+    /// crossed it in the meantime. This is what makes the max-age policy
+    /// actually proactive rather than merely checked-on-next-use: an idle
+    /// session that never sends or receives anything still gets rotated,
+    /// and the next message from that peer (in either direction) finds no
+    /// session and goes through a fresh Noise handshake instead.
+    ///
+    /// Takes `&Arc<Self>` as a plain parameter rather than an arbitrary
+    /// `self: &Arc<Self>` receiver — the latter isn't a stable receiver
+    /// type outside of `self: Arc<Self>` by value, so this is called as
+    /// `PeerSession::spawn_max_age_reaper(&session)`, not
+    /// `session.spawn_max_age_reaper()`.
+    ///
+    /// Call once, right after a session is constructed and wrapped in its
+    /// `Arc` (all three `PeerSession::new` call sites in this file do
+    /// this immediately after `sessions.insert`).
+    pub fn spawn_max_age_reaper(session: &Arc<PeerSession>) {
+        let session = Arc::clone(session);
+        tokio::spawn(async move {
+            tokio::time::sleep(session.max_age).await;
+            log::info!(
+                "Session rotation: max age ({:?}) reached for {} (session opened {:?} ago), \
+                 proactively closing — next message from this peer will require a fresh \
+                 Noise handshake",
+                session.max_age,
+                session.remote_addr,
+                session.created_at.elapsed()
+            );
+            session.evict(b"session max age reached");
+        });
     }
 
     /// Decrypt `ciphertext` using the next available nonce.
@@ -174,8 +409,24 @@ impl PeerSession {
     /// Returns the decrypted plaintext on success. The nonce counter is
     /// incremented even on failure (to stay in sync with the sender's
     /// counter) so callers should close the connection on error.
+    ///
+    /// Checks `recv_nonce` against `NONCE_EXHAUSTION_MARGIN` before
+    /// attempting the actual decrypt — see the module-level comment above
+    /// `PeerSession` for why. On exhaustion the session is evicted here
+    /// (distinct log line, see `check_nonce_exhaustion`) and an `Err` is
+    /// still returned, so existing call sites' own "close on decrypt
+    /// error" handling runs too (harmlessly redundant with the eviction
+    /// that already happened — see `evict`'s doc comment on why that's
+    /// safe).
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let nonce = self.recv_nonce.fetch_add(1, Ordering::AcqRel);
+        if self.check_nonce_exhaustion(nonce, "recv") {
+            return Err(anyhow!(
+                "Noise recv nonce exhausted for session {} (nonce={}); session evicted",
+                self.remote_addr,
+                nonce
+            ));
+        }
         let mut plaintext = vec![0u8; ciphertext.len()];
         let n = self
             .noise
@@ -255,11 +506,32 @@ impl PeerSession {
     }
 
     /// Encrypt and send a gossip message over a new uni-stream.
+    ///
+    /// Checks `send_nonce` against `NONCE_EXHAUSTION_MARGIN` after the
+    /// send (see the module-level comment above `PeerSession`) rather
+    /// than threading the exact nonce this call used back out of
+    /// `encrypt`/`send_uni_framed` — this is a coarse "are we anywhere
+    /// near the limit at all" check with ~4.29 billion messages of
+    /// headroom (`NONCE_EXHAUSTION_MARGIN`), so reading the counter's
+    /// current value here rather than the precise nonce this call
+    /// consumed is fine, including under concurrent `send_gossip`/
+    /// `send_control` calls racing on the same shared counter.
     pub async fn send_gossip(&self, payload: &[u8]) -> Result<()> {
         // SECURITY: Encrypt outbound gossip to prevent plaintext exposure over QUIC
         // uni-streams. The Noise protocol is symmetric, but previously we only
         // decrypted inbound.
-        self.send_uni_framed(STREAM_TYPE_GOSSIP, payload).await
+        let result = self.send_uni_framed(STREAM_TYPE_GOSSIP, payload).await;
+
+        let nonce = self.send_nonce.load(Ordering::Acquire);
+        if self.check_nonce_exhaustion(nonce, "send") {
+            return Err(anyhow!(
+                "Noise send nonce exhausted for session {} (nonce={}); session evicted",
+                self.remote_addr,
+                nonce
+            ));
+        }
+
+        result
     }
 
     /// Send a `ControlMsg` request over a fresh bi-stream and wait for the
@@ -465,19 +737,41 @@ fn envelope_dedup_id(data: &[u8]) -> [u8; 32] {
 /// broadcast. Wiring it into both `handle_native_connection` and
 /// `handle_web_connection` keeps QUIC and WebTransport peers on the same
 /// relay path.
+/// Default cap on concurrent outbound `send_gossip` calls during a single
+/// relay fan-out. This is separate from `PeerSession::stream_semaphore`
+/// (which bounds concurrent streams on one connection) — this one bounds
+/// total concurrent relay sends across *all* sessions at once, so a
+/// large session set can't spike this node's outbound task/socket
+/// pressure all at the same instant. Same pattern cogitator-worker's
+/// round-robin coordinator uses for its own bounded fan-out.
+const DEFAULT_RELAY_FANOUT_CONCURRENCY: usize = 50;
+
 pub struct GossipRelay {
     sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
     /// Bounded cache of recently-seen message ids, used to stop a gossip
     /// message from bouncing indefinitely between peers whose session sets
     /// overlap (previously bounded only by TTL reaching 0).
     seen: Mutex<SeenSet>,
+    /// Caps concurrent outbound sends during `relay()`'s fan-out. See
+    /// `DEFAULT_RELAY_FANOUT_CONCURRENCY`.
+    fanout_semaphore: Arc<Semaphore>,
 }
 
 impl GossipRelay {
     pub fn new(sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>) -> Self {
+        Self::with_fanout_concurrency(sessions, DEFAULT_RELAY_FANOUT_CONCURRENCY)
+    }
+
+    /// Same as `new`, but with a configurable outbound fan-out concurrency
+    /// cap instead of `DEFAULT_RELAY_FANOUT_CONCURRENCY`.
+    pub fn with_fanout_concurrency(
+        sessions: Arc<DashMap<SocketAddr, Arc<PeerSession>>>,
+        max_concurrent_relays: usize,
+    ) -> Self {
         Self {
             sessions,
             seen: Mutex::new(SeenSet::new()),
+            fanout_semaphore: Arc::new(Semaphore::new(max_concurrent_relays)),
         }
     }
 
@@ -525,7 +819,17 @@ impl GossipRelay {
 
         for (peer_addr, session) in targets {
             let payload = payload.clone();
+            let fanout_semaphore = self.fanout_semaphore.clone();
             tokio::spawn(async move {
+                // acquire_owned so the permit is held inside the spawned
+                // task without borrowing `self` — same fix already applied
+                // to `PeerSession::stream_semaphore` acquisition elsewhere
+                // in this file for the identical borrow-checker reason.
+                // This is what actually enforces the concurrency cap: at
+                // most `max_concurrent_relays` of these sends are ever
+                // in flight at once, regardless of how many targets this
+                // fan-out has.
+                let _permit = fanout_semaphore.acquire_owned().await;
                 if let Err(e) = session.send_gossip(&payload).await {
                     log::debug!("Gossip relay: send to {} failed: {}", peer_addr, e);
                 }
@@ -658,6 +962,19 @@ where
         *self.external_addr.lock().await = Some(addr);
     }
 
+    /// Shared, read-only access to the routing table.
+    ///
+    /// ADDED for messenger-core's `send_direct_message` (direct-delivery
+    /// routing needs `PrimusDHT::find_closest` to resolve a NodeID to an
+    /// address before it can decide between an existing session, a fresh
+    /// dial, or a gossip-relay fallback). `dht` was previously a private
+    /// field — every other cross-crate access point on this struct
+    /// (`sessions`, `relay`, `connect_to_peer`) was already `pub`, so this
+    /// brings `dht` in line rather than introducing a new access pattern.
+    pub fn dht(&self) -> &PrimusDHT {
+        &self.dht
+    }
+
     /// Start serving. Spawns two accept loops (QUIC + WebTransport) and
     /// returns only on unrecoverable error.
     pub async fn run(self) -> Result<()> {
@@ -781,6 +1098,97 @@ where
         futures::future::pending::<Result<()>>().await
     }
 
+    /// Arc-receiver variant of `run()` for callers that need to keep an
+    /// `Arc<PrimusNetworkServer>` alive alongside the running server (e.g.
+    /// `messenger-cli`, which holds DHT + session handles for its REPL).
+    ///
+    /// Identical to `run(self)` but takes `self: Arc<Self>` — all fields
+    /// are cloned out of the Arc at the top, so the Arc only needs to be
+    /// the last strong reference *into the server's fields*, not necessarily
+    /// the *only* strong reference overall.  The caller can hold additional
+    /// Arcs for read access after `run_arc` is spawned, and the background
+    /// task driving the accept loops holds the Arc passed here.
+    pub async fn run_arc(self: Arc<Self>) -> Result<()> {
+        log::info!(
+            "P2P: QUIC listener active on {}",
+            self.endpoint.local_addr()?
+        );
+        if self.wt_listener.is_some() {
+            log::info!(
+                "P2P: WebTransport listener active on port {}",
+                self.endpoint.local_addr()?.port() + 1
+            );
+        }
+
+        self.kademlia.clone().start_maintenance();
+
+        let ingress      = self.ingress.clone();
+        let kademlia     = self.kademlia.clone();
+        let local_nr     = self.local_nr.clone();
+        let noise_static = self.noise_static;
+        let ml_dsa_sk    = self.ml_dsa_sk.clone();
+        let sessions     = self.sessions.clone();
+        let frame_drops  = self.frame_drops.clone();
+        let dht          = self.dht.clone();
+        let relay        = self.relay.clone();
+        // Move the endpoint out by clone (quinn::Endpoint is cheaply Clone).
+        let quic_endpoint = self.endpoint.clone();
+        // wt_listener is an Option; we need to move it out to pass to the WT
+        // loop.  We can't move out of an Arc, so we use an unsafe deref here
+        // ... actually we can't do that either cleanly.  Instead, call the
+        // Arc's fields through a DerefMut — but Arc doesn't give DerefMut.
+        //
+        // Pragmatic solution: for the WT listener we accept it may not be
+        // started if called via run_arc (the field is Option and already
+        // consumed by the closure in run() via `if let Some(wt) = self.wt_listener`).
+        // The CLI does not need WebTransport; skip it here by using None.
+        // A full solution would wrap wt_listener in Mutex<Option<…>> or a
+        // one-shot, but that's out of scope for this debug tool.
+        //
+        // QUIC accept loop (same as run()):
+        {
+            let quic_ingress    = ingress.clone();
+            let quic_kademlia   = kademlia.clone();
+            let quic_nr         = local_nr.clone();
+            let quic_sk         = ml_dsa_sk.clone();
+            let quic_sessions   = sessions.clone();
+            let quic_frame_drops = frame_drops.clone();
+            let quic_dht        = dht.clone();
+            let quic_relay      = relay.clone();
+
+            tokio::spawn(async move {
+                while let Some(incoming) = quic_endpoint.accept().await {
+                    let m  = quic_ingress.clone();
+                    let _k = quic_kademlia.clone();
+                    let nr = quic_nr.clone();
+                    let sk = quic_sk.clone();
+                    let s  = quic_sessions.clone();
+                    let fd = quic_frame_drops.clone();
+                    let d  = quic_dht.clone();
+                    let r  = quic_relay.clone();
+
+                    tokio::spawn(async move {
+                        match incoming.await {
+                            Ok(conn) => {
+                                if let Err(e) = handle_native_connection(
+                                    conn, m, _k, nr, noise_static, sk, s, fd, d, r,
+                                ).await {
+                                    log::warn!("QUIC connection error: {}", e);
+                                }
+                            }
+                            Err(e) => log::warn!("QUIC incoming connection failed: {}", e),
+                        }
+                    });
+                }
+            });
+        }
+
+        // Note: WebTransport listener is not started here — see comment above.
+        // If WT is needed, use run(self) (via Arc::try_unwrap) instead.
+
+        futures::future::pending::<Result<()>>().await
+    }
+
     /// Dial out to `target_addr` over QUIC and establish a peer session.
     ///
     /// Used for connecting to peers discovered via LAN discovery
@@ -873,7 +1281,10 @@ where
         let session = Arc::new(PeerSession::new(
             PrimusConnection::Quic(connection.clone()),
             noise_state,
+            remote_addr,
+            &self.sessions,
         ));
+        PeerSession::spawn_max_age_reaper(&session);
         self.sessions.insert(remote_addr, session);
 
         log::info!(
@@ -1136,7 +1547,10 @@ where
     let session = Arc::new(PeerSession::new(
         PrimusConnection::Quic(connection.clone()),
         noise_state,
+        remote_addr,
+        &sessions,
     ));
+    PeerSession::spawn_max_age_reaper(&session);
     sessions.insert(remote_addr, session);
 
     log::info!("QUIC: Noise_XX handshake complete for {}", remote_addr);
@@ -1307,7 +1721,10 @@ where
     let session = Arc::new(PeerSession::new(
         PrimusConnection::Web(arc_conn.clone()),
         noise_state,
+        remote_addr,
+        &sessions,
     ));
+    PeerSession::spawn_max_age_reaper(&session);
     sessions.insert(remote_addr, session);
 
     log::info!(
@@ -1439,9 +1856,9 @@ where
         ));
     }
 
-    // ── Decrypt ───────────────────────────────────────────────────────────────
-    let plaintext = match sessions.get(&remote_addr) {
-        Some(session) => session.decrypt(ciphertext)?,
+    // ── Look up session (needed for both the rate check and decrypt) ───────────
+    let session = match sessions.get(&remote_addr) {
+        Some(s) => s.value().clone(),
         None => {
             return Err(anyhow!(
                 "Gossip: received data from {} before Noise handshake completed",
@@ -1449,6 +1866,31 @@ where
             ));
         }
     };
+
+    // ── Per-source-peer rate limit ──────────────────────────────────────────────
+    //
+    // Checked before decrypt so a flooding peer burns neither our crypto
+    // cycles nor (further down) the relay fan-out semaphore. This is an
+    // outright drop, not a queue — an over-limit frame is logged at `warn`
+    // and this stream handler returns `Ok(())` immediately, same as the
+    // dedup-drop path below, so a flood never builds unbounded backlog and
+    // never tears the connection down (unlike a decrypt/nonce failure,
+    // this isn't a protocol violation, just a rate the peer needs to back
+    // off from).
+    {
+        let mut bucket = session.gossip_rate_limiter.lock().await;
+        if !bucket.try_acquire() {
+            frame_drops.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "Gossip: rate limit exceeded for {}, dropping frame",
+                remote_addr
+            );
+            return Ok(());
+        }
+    }
+
+    // ── Decrypt ───────────────────────────────────────────────────────────────
+    let plaintext = session.decrypt(ciphertext)?;
 
     // ── Deserialize Envelope ─────────────────────────────────────────────────
     let message: crate::network::PrimusMessage =
@@ -1485,12 +1927,6 @@ where
             tokio::spawn(async move {
                 relay.relay(&relay_data, ttl, remote_addr).await;
             });
-        }
-        _ => {
-            log::debug!(
-                "Gossip: received unsupported message type from {}",
-                remote_addr
-            );
         }
     }
 

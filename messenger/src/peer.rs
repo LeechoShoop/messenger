@@ -116,13 +116,23 @@ impl PrimusNR {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ml_dsa::{KeyGen, MlDsa87};
+    use rand::rngs::OsRng;
 
-    fn keypair() -> (Vec<u8>, SocketAddr) {
-        // NOTE: replace with a real ML-DSA-87 keygen call once wired into a
-        // build — this module has not been compiled against the crate yet.
-        // Left as a placeholder so the test file states its own assumption
-        // rather than silently compiling against the wrong shape.
-        (vec![0u8; SIGNING_KEY_LEN], "127.0.0.1:9000".parse().unwrap())
+    /// Generate a real ML-DSA-87 keypair using the production key-gen path
+    /// (`MlDsa87::key_gen`). Returns `(public_key_bytes, signing_key_bytes,
+    /// addr)` — the same shapes `PrimusNR::new` expects.
+    ///
+    /// Previously this returned a dummy all-zero signing key (a placeholder
+    /// that admitted it couldn't produce a real `PrimusNR`). That's been
+    /// replaced here with a real `KeyGen` call so the tests below actually
+    /// exercise the sign / verify path rather than silently skipping it.
+    fn real_keypair(addr: &str) -> (Vec<u8>, Vec<u8>, SocketAddr) {
+        let mut rng = OsRng;
+        let kp = MlDsa87::key_gen(&mut rng);
+        let pk = kp.verifying_key().encode().to_vec();
+        let sk = kp.signing_key().encode().to_vec();
+        (pk, sk, addr.parse().unwrap())
     }
 
     #[test]
@@ -139,5 +149,48 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let nr = PrimusNR { public_key: vec![1, 2, 3], addr, signature: vec![4, 5, 6] };
         assert!(!nr.verify());
+    }
+
+    /// Exercises the full keygen → sign → verify roundtrip with a real
+    /// ML-DSA-87 keypair, confirming `PrimusNR::new` and `PrimusNR::verify`
+    /// actually work rather than just compiling.
+    #[test]
+    fn sign_and_verify_roundtrip_with_real_keypair() {
+        let (pk, sk, addr) = real_keypair("127.0.0.1:19000");
+        let nr = PrimusNR::new(addr, &pk, &sk).expect("PrimusNR::new failed with real keypair");
+        assert!(
+            nr.verify(),
+            "PrimusNR::verify() must return true for a freshly self-signed record"
+        );
+    }
+
+    /// Tampering with any byte of the signature must cause `verify()` to
+    /// return false.
+    #[test]
+    fn verify_rejects_tampered_signature() {
+        let (pk, sk, addr) = real_keypair("127.0.0.1:19001");
+        let mut nr = PrimusNR::new(addr, &pk, &sk).expect("PrimusNR::new failed");
+        // Flip the first byte of the signature.
+        if let Some(b) = nr.signature.first_mut() {
+            *b ^= 0xFF;
+        }
+        assert!(
+            !nr.verify(),
+            "verify() must reject a record whose signature has been tampered with"
+        );
+    }
+
+    /// `node_id()` must equal `SHA3-256(public_key)` — same derivation as
+    /// `dht.rs`'s 256-bucket key space.
+    #[test]
+    fn node_id_matches_sha3_256_of_public_key() {
+        let (pk, sk, addr) = real_keypair("127.0.0.1:19002");
+        let nr = PrimusNR::new(addr, &pk, &sk).expect("PrimusNR::new failed");
+        let expected: [u8; 32] = {
+            let mut h = Sha3_256::new();
+            h.update(&pk);
+            h.finalize().into()
+        };
+        assert_eq!(nr.node_id(), expected);
     }
 }
