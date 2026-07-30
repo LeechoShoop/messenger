@@ -26,3 +26,8 @@ sha3 = "0.10"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-test = "0.4"
+# Integration tests: keygen + real network stack
+rand = "0.8"
+ml-dsa = { version = "0.0.4", default-features = false, features = ["rand_core"] }
+rustls = "0.23"
+quinn = "0.11"
