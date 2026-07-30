@@ -151,6 +151,21 @@ impl MessengerCore {
         self.store.lock().await.len()
     }
 
+    /// Return all messages (sent or received) for the given peer, sorted by sent_at.
+    pub async fn conversation(&self, peer: &NodeId) -> Vec<StoredMessage> {
+        let store = self.store.lock().await;
+        let mut msgs: Vec<_> = store
+            .values()
+            .filter(|m| {
+                m.envelope.kind == MessageKind::DirectMessage
+                    && (&m.envelope.sender_node_id == peer || &m.envelope.recipient_node_id == peer)
+            })
+            .cloned()
+            .collect();
+        msgs.sort_by_key(|m| m.envelope.sent_at);
+        msgs
+    }
+
     /// Record that `envelope` (expected to be `MessageKind::DirectMessage`)
     /// is being sent by this node, with status `Sent`, so a later
     /// `DeliveryReceipt` has something to update to `Delivered`.

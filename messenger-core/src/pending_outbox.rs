@@ -258,6 +258,7 @@ pub async fn run_retry_loop<M, K>(
     server: Arc<PrimusNetworkServer<M, K>>,
     core: Arc<MessengerCore>,
     outbox: Arc<PendingOutbox>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<(crate::envelope::MessageId, DeliveryResult)>>,
 ) where
     M: MessageIngress,
     K: KademliaHandler,
@@ -275,7 +276,7 @@ pub async fn run_retry_loop<M, K>(
 
     loop {
         ticker.tick().await;
-        run_retry_pass(&server, &core, &outbox).await;
+        run_retry_pass(&server, &core, &outbox, event_tx.clone()).await;
     }
 }
 
@@ -286,6 +287,7 @@ pub async fn run_retry_pass<M, K>(
     server: &Arc<PrimusNetworkServer<M, K>>,
     core: &Arc<MessengerCore>,
     outbox: &Arc<PendingOutbox>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<(crate::envelope::MessageId, DeliveryResult)>>,
 ) where
     M: MessageIngress,
     K: KademliaHandler,
@@ -319,7 +321,11 @@ pub async fn run_retry_pass<M, K>(
 
         for (envelope, first_queued_at) in retryable {
             let message_id = envelope.message_id;
-            match delivery::send_direct_message(server, recipient, envelope.clone()).await {
+            let result = delivery::send_direct_message(server, recipient, envelope.clone()).await;
+            if let Some(tx) = &event_tx {
+                let _ = tx.send((message_id, result.clone()));
+            }
+            match result {
                 DeliveryResult::Failed => {
                     log::debug!(
                         "PendingOutbox: retry still failing for {} to {}, re-queued",

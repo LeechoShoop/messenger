@@ -22,17 +22,24 @@ You will need the Rust toolchain installed on your machine.
 
 ### Building and Running
 
-The project consists of a core library (`messenger`) and two main binaries.
+The project consists of a core library (`messenger`) and three main binaries.
 
-1. **Run the Messenger CLI**
+1. **Run the Messenger TUI (Terminal UI)**
+   A rich, ratatui-based terminal application for chatting, featuring resizable panes, conversation tabs, themes, and animated message delivery.
+   ```bash
+   cargo run --bin messenger-tui
+   ```
+   *Features: Press `?` for keybindings, `Alt+Left/Right` to switch tabs, `Shift+Left/Right` to resize sidebar.*
+
+2. **Run the Messenger CLI**
    A minimal, interactive REPL for interacting with the network, sending messages, and checking peers.
    ```bash
    cargo run --bin messenger-cli
    ```
    *Available commands in the CLI: `whoami`, `peers`, `send <node_id> <message>`, `quit`.*
 
-2. **Run the Messenger Daemon**
-   Runs the network node in the background without the interactive CLI.
+3. **Run the Messenger Daemon**
+   Runs the network node in the background without any interactive UI.
    ```bash
    cargo run --bin messenger
    ```

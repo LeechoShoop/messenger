@@ -91,6 +91,7 @@ pub async fn run_outbound_dispatch<M, K>(
     server: Arc<PrimusNetworkServer<M, K>>,
     mut outbound_rx: OutboundReceiver,
     outbox: Arc<PendingOutbox>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<(crate::envelope::MessageId, DeliveryResult)>>,
 ) where
     M: MessageIngress,
     K: KademliaHandler,
@@ -107,6 +108,9 @@ pub async fn run_outbound_dispatch<M, K>(
         // but a `Failed` result needs the envelope back to queue it.
         let retry_copy = envelope.clone();
         let result = delivery::send_direct_message(&server, recipient_node_id, envelope).await;
+        if let Some(tx) = &event_tx {
+            let _ = tx.send((message_id, result.clone()));
+        }
         log::debug!(
             "Outbound dispatch: {:?} {} -> {:?}",
             kind,
